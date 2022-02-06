@@ -3,6 +3,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE BangPatterns #-}
+{-# OPTIONS_GHC -Wno-type-defaults #-}
+{-# LANGUAGE BlockArguments #-}
 
 -- | @futhark repl@
 module Futhark.CLI.REPL (main) where
@@ -25,7 +29,7 @@ import Futhark.Pipeline
 import Futhark.Util (fancyTerminal, toPOSIX)
 import Futhark.Util.Options
 import Futhark.Version
-import Language.Futhark
+import Language.Futhark hiding (Value, matchDims)
 import qualified Language.Futhark.Interpreter as I
 import Language.Futhark.Parser hiding (EOF)
 import qualified Language.Futhark.Semantic as T
@@ -35,6 +39,15 @@ import qualified System.Console.Haskeline as Haskeline
 import System.Directory
 import System.FilePath
 import Text.Read (readMaybe)
+import qualified Data.Array as D
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
+import qualified Data.ByteString.Lazy as BL
+import Futhark.IR.Primitive (valueIntegral)
+import System.Process (CreateProcess (delegate_ctlc), withCreateProcess, waitForProcess, proc)
+import qualified Data.Map as M
+import GHC.IO.Exception (ExitCode(ExitSuccess, ExitFailure))
+import Futhark.Test (getExpectedResult)
 
 banner :: String
 banner =
@@ -305,14 +318,42 @@ onExp e = do
     (_, Right (tparams, e'))
       | null tparams -> do
         r <- runInterpreter $ I.interpretExp ienv e'
-        case r of
-          Left err -> liftIO $ print err
-          Right v -> liftIO $ putStrLn $ pretty v
+        do process e' r
       | otherwise -> liftIO $ do
         putStrLn $ "Inferred type of expression: " ++ pretty (typeOf e')
         putStrLn $
           "The following types are ambiguous: "
             ++ intercalate ", " (map (prettyName . typeParamName) tparams)
+  where
+    process :: Exp -> Either I.InterpreterError I.Value -> FutharkiM ()
+    process _ (Left err) = liftIO $ print err
+    process (Attr (AttrAtom (AtomName "proc") _) _ _) (Right (I.ValueRecord m)) =
+      exec cmd args
+      where
+        cmd = head vs
+        args = tail vs
+        vs = map (C.unpack . msg) $ M.elems m
+    process (Attr (AttrAtom (AtomName "raw") _) _ _) (Right vs@(I.ValueArray _ _)) =
+      liftIO $ do C.putStrLn $ msg vs
+    process (Attr (AttrAtom (AtomName "proc") _) _ _) (Right vs@(I.ValueArray _ _)) =
+      exec cmd []
+        where
+        cmd = C.unpack $ msg vs
+    process (Attr (AttrAtom (AtomName "ast") _) v _) _ =
+      liftIO $ do print v
+    process _ (Right v) =
+      liftIO $ putStrLn $ pretty v
+    msg (I.ValueArray _ vs) = B.pack $ map (fromIntegral . getValue) $ D.elems vs
+    msg _ = error "Value type not supported"
+    getValue (I.ValuePrim (UnsignedValue v)) = valueIntegral v
+    getValue (I.ValuePrim (SignedValue v)) = valueIntegral v
+    getValue _ = error "Value type not supported"
+    exec cmd args = liftIO $ do
+      exit_code <- withCreateProcess (proc cmd args) { delegate_ctlc = True } $ \_ _ _ p ->
+        waitForProcess p
+      case exit_code of
+        ExitSuccess   -> return ()
+        ExitFailure _ -> putStrLn $ "Process failed with exit code " ++ show exit_code
 
 prettyBreaking :: Breaking -> String
 prettyBreaking b =
@@ -400,13 +441,225 @@ loadCommand file = do
     (True, Nothing) -> liftIO $ T.putStrLn "No file specified and no file previously loaded."
     (False, _) -> throwError $ Load $ T.unpack file
 
-genTypeCommand ::
+-- Print a la Python, formatted string literal
+-- Supported specifiers:
+-- s: utf-8 string (for arrays)
+-- x: hexadecimal
+-- X: hexadecimal
+-- b: binary
+-- d: decimal
+-- #: prefix 0x, 0X, 0b resp. x, X, b
+-- [..fmt sep..]: separator for arrays; can be nested
+-- (fmt1, fmt2, ...): format for tuples 
+-- $: type suffix; can be placed after array, tuple or after value specifier
+-- Examples
+-- > let str = "foo"
+-- > :print "as array: {str}"
+-- as array: [102u8, 111u8, 111u8]
+-- > :print "as array: {str:[..d$, ..]}"
+-- as array: [102u8, 111u8, 111u8]
+-- > :print "as array with top level type: {str:[..d, ..]$}"
+-- as array with top level type: [102, 111, 111][3]u8
+-- > :print "as array of plain decimals: {str:[..d, ..]}"
+-- as array of plain decimals: [102, 111, 111]
+-- > :print "as array of hex: {str:[..#X, ..]}"
+-- as array of hex: [0X66, 0X6F, 0X6F]
+-- > :print "as upper hex string: {str:X}"
+-- as upper hex string: 666F6F
+-- > :print "as lower hex string: {str:x}"
+-- as lower hex string: 666f6f
+-- > :print "as string: {str:s}"
+-- as string: foo
+-- > let strint = ("foo", [1i32, 42i32])
+-- > :print "tuple: {strint:(0:[..d$, ..], 1:[..#x$, ..])}"
+-- tuple: ([102u8, 111u8, 111u8], [0x00000001u32, 0x0000002au32])
+
+-- Data structures
+data FormatType = FormatStr | FormatBin | FormatHex | FormatHeX | FormatDec
+instance Show FormatType where
+  show FormatStr = "string"
+  show FormatBin = "binary"
+  show FormatHex = "hexadecimal"
+  show FormatHeX = "hexadecimal"
+  show FormatDec = "decimal"
+data Format =
+  FormatArray { lbracket :: String, fmt:: Format, sep :: String, rbracket:: String, suffix :: Bool } |
+  FormatTuple { start :: String, elems :: [{fmt :: Format, sep :: String}], suffix :: Bool } |
+  FormatValue {
+    prefix :: Bool,
+    ftype :: FormatType,
+    suffix :: Bool
+  } |
+  StringPart String
+data FormatExp = FormatExp String Format | FormatDefault String | StringPart String
+type FormatString = [FormatExp]
+-- Convenient defaults
+formatArray = FormatArray {sep="", suffix=False, prefix=False}
+formatTuple = FormatTuple {suffix=False}
+formatValue = FormatValue {prefix=False, suffix=False}
+
+-- Rendering
+printf :: (String -> IO I.Value) -> FormatString -> IO BL.ByteString
+printf expint fs = foldM (return $ printfmt expint) BL.empty fs
+
+printfexp :: (String -> IO I.Value) -> FormatExp -> IO BL.ByteString
+printfexp _ (FormatDefault v) = return show v
+printfexp _ (StringPart s) = return show s
+printfexp expint len (FormatExp s fmt) = do
+  exp <- expint s
+  return printfmt exp fmt
+
+printfmt :: Format -> I.Value -> BL.ByteString
+printfmt (FormatArray {sep=sep, suffix=suffix, fmt=fmt, lbracket=lbracket, rbracket=rbracket}) (I.ValueArray _ vs) =
+  lbracket <>
+  intercalate sep (map (printfmt fmt) elems) <>
+  rbracket <>
+  showSuffix suffix v
+--printfmt (FormatTuple {start=start, elems=elems, suffix=suffix}) (I.ValueRecord vs) =
+--  start <>
+--  showRecord v elems <>
+--  showSuffix suffix v
+printfmt fmt@(FormatValue {ftype=ftype, suffix=suffix, prefix=prefix}) (I.ValueArray _ vs) =
+  showPrefix prefix ftype <>
+  BL.concat $ map (printfmt fmt) vs <>
+  showSuffix suffix arr
+  --show (FormatValue {value=(I.ValueRecord vs), fmt=fmt, suffix=suffix, prefix=prefix}) =
+  --  (showPrefix prefix fmt) ++
+  --  (unwords $ (elems vs) <&> (\v -> show $ formatValue {value=v, fmt=fmt})) ++
+  --  (showSuffix suffix fmt)
+printfmt (FormatValue {prefix=prefix, suffix=suffix, ftype=ftype}) (I.ValuePrim v) =
+  showPrefix prefix ftype <>
+  showValue v <>
+  showSuffix suffix
+printfmt _ (FormatValue v) =
+  "Don't know how to display value: " <> show v
+ 
+showPrefix :: Bool -> FormatType -> String
+showPrefix False _ = ""
+showPrefix True FormatHex = "0x"
+showPrefix True FormatHeX = "0x"
+showPrefix True FormatBin = "0b"
+showPrefix True FormatDec = ""
+showPrefix True FormatStr = ""
+
+showSuffix :: Bool -> I.Value -> String
+showSuffix False _ = ""
+showSuffix True v = showType v
+
+showType :: I.Value -> String
+showType (PrimValue v@(UnsignedValue _)) = "u" ++ (valueSize v)
+showType (PrimValue v@(FloatValue _)) = "f" ++ (valueSize v)
+showType (PrimValue v@(BoolValue _)) = "bool"
+showType (I.ValueArray s (v: _)) = pretty s ++ (showType v)
+showType (I.ValueArray s _) = pretty s
+showType (I.ValueRecord m)
+  | Just vs <- areTupleFields m =
+    "(" ++ (intercalate ", " $ map showType vs) ++ ")"
+  | otherwise =
+    "{" ++ (intercalate ", " $ map field $ M.toList m) ++ "}"
+  where
+    field (k, v) = (nameToString k) ++ ": " ++ (showType v)
+showType (I.ValueSum _ n vs)
+  | numElements vs == 0 = "#" ++ (nameToString n)
+  | otherwise = "#" ++ (nameToString n) ++ " " ++ (intercalate " " $ map showType vs)
+showType v = "Type not found for value: " ++ (pretty v)
+
+showValue :: FormatType -> I.PrimValue -> String
+showValue FormatStr (UnsignedValue v) = C.unpack $ B.pack $ fromIntegral
+showValue FormatHex (UnsignedValue v) = show $ hexString $ B.pack $ toLower $ fromIntegral
+showValue FormatHeX (UnsignedValue v) = show $ hexString $ B.pack $ toUpper $ fromIntegral
+showValue FormatBin (UnsignedValue v) = show $ B.pack $ map word2bin $ fromIntegral
+showValue FormatDec (UnsignedValue v) = show v
+showValue FormatDec (SignedValue v) = show v
+showValue FormatDec (FloatValue v) = show v
+showValue FormatDec (BoolValue v) = show v
+showValue FormatBin (BoolValue True) = "1"
+showValue FormatBin (BoolValue False) = "0" 
+showValue ftype (SignedValue v) = showValue ftype (SignedValue v)
+showValue ftype v = "Don't know how to display " <> show ftype <> " format for " <> show v
+
+word2bin :: Word8 -> [Word8]
+wordbin w =
+  [testBit w i | i <- [0.. finiteBitSize w - 1]] <&> bool2word
+  where
+    bool2word False = fromIntegral 0
+    bool2word True = fromIntegral 1
+
+valueSize :: I.PrimValue -> String
+valueSize (UnsignedValue (Int8Value _)) = "8"
+valueSize (UnsignedValue (Int16Value _)) = "16"
+valueSize (UnsignedValue (Int32Value _)) = "32"
+valueSize (UnsignedValue (Int64Value _)) = "64"
+valueSize (SignedValue v) = valueSize (UnsignedValue v)
+valueSize (FloatValue (Float16Value _ )) = "16"
+valueSize (FloatValue (Float32Value _ )) = "32"
+valueSize (FloatValue (Float64Value _ )) = "32"
+
+-- Parsing
+p_formatstring =
+  between '"' '"' $ many $ choice [
+    p_stringpart <&> StringPart,
+    between '{' '}' choice [
+      p_exp <* char ':' <*> p_format <&> FormatExp,
+      p_exp <&> FormatDefault
+    ]
+  ]
+
+p_exp = (many (noneOf [char ':']))
+
+p_format = choice [
+  FormatArray <$> p_prefix <*> single <*> string ".." <*> p_format <*> p_sep <*> string ".." <*> single <*> p_suffix,
+  FormatValue <$> p_prefix <*> p_ftype <*> p_suffix
+]
+
+p_sep = many $ single <* notFollowedBy $ char '.'
+
+p_prefix =
+  choice [
+    char '#' $> True,
+    return False :: Parser Bool
+  ]
+p_ftype =
+  choice [
+    char 'x' $> FormatHex,
+    char 'X' $> FormatHeX,
+    char 'b' $> FormatBin,
+    char 's' $> FormatStr,
+    char 'd' $> FormatDec
+  ]
+p_suffix = 
+  choice [
+    char '$' $> True,
+    return False :: Parser Bool
+  ]
+p_stringpart = many $
+  choice [
+    noneOf [char '{', char '}', eof],
+    string "{{" $> '{',
+    string "}}" $> '}'
+  ]
+
+printCommand :: Command
+printCommand =
+  genCommand parseExp T.checkExp $ \(tparams, e) -> do
+    if null tparams then do
+      (imports, src, tenv, ienv) <- getIt
+      r <- runInterpreter $ I.interpretExp ienv e
+      
+      else
+        liftIO $ putStrLn "Cannot print declaration."
+
+-- Display Futhark AST for expression or declaration
+astCommand :: Command
+astCommand = genCommand parseExp T.checkExp $ \(_, e) -> liftIO $ print e
+
+genCommand ::
   Show err =>
   (String -> T.Text -> Either err a) ->
   (Imports -> VNameSource -> T.Env -> a -> (Warnings, Either T.TypeError b)) ->
-  (b -> String) ->
+  (b -> FutharkiM ()) ->
   Command
-genTypeCommand f g h e = do
+genCommand f g h e = do
   prompt <- getPrompt
   case f prompt e of
     Left err -> liftIO $ print err
@@ -416,16 +669,17 @@ genTypeCommand f g h e = do
       (tenv, _) <- gets futharkiEnv
       case snd $ g imports src tenv e' of
         Left err -> liftIO $ putStrLn $ pretty err
-        Right x -> liftIO $ putStrLn $ h x
+        Right x -> h x
 
 typeCommand :: Command
-typeCommand = genTypeCommand parseExp T.checkExp $ \(ps, e) ->
-  pretty e <> concatMap ((" " <>) . pretty) ps
+typeCommand = genCommand parseExp T.checkExp $ \(ps, e) ->
+  liftIO $ putStrLn $ pretty e <> concatMap ((" " <>) . pretty) ps
     <> " : "
     <> pretty (typeOf e)
 
 mtypeCommand :: Command
-mtypeCommand = genTypeCommand parseModExp T.checkModExp $ pretty . fst
+mtypeCommand = genCommand parseModExp T.checkModExp $ \(ps, _) ->
+  liftIO $ putStrLn $ pretty ps
 
 unbreakCommand :: Command
 unbreakCommand _ = do
@@ -519,6 +773,13 @@ Show the type of an expression, which must fit on a single line.
       ( mtypeCommand,
         [text|
 Show the type of a module expression, which must fit on a single line.
+|]
+      )
+    ),
+    ( "ast",
+      ( astCommand,
+        [text|
+Show the Futhark AST of a declaration or expression.
 |]
       )
     ),
