@@ -336,7 +336,8 @@ library
     , futhark-manifest >= 1.0.0.0
     , githash >=0.1.6.1
     , half >= 0.3
-    , haskeline
+    , haskeline >= 0.6.3
+    , terminfo >= 0.4.1.5
     , language-c-quote >=0.12
     , mainland-pretty >=0.7.1
     , cmark-gfm >=0.2.1
