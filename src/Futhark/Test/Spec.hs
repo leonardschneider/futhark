@@ -48,8 +48,14 @@ import System.FilePath
 import System.IO.Error
 import Text.Megaparsec hiding (many, some)
 import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as L
 import Text.Regex.TDFA
 import Prelude
+import Futhark.Data (Value (U8Value))
+import qualified Data.ByteString as B
+import qualified Data.Vector.Storable as SVec
+import Data.Vector.Storable.ByteString
+import Data.Text.Encoding (encodeUtf8)
 
 -- | Description of a test to be carried out on a Futhark program.
 -- The Futhark program is stored separately.
@@ -319,12 +325,17 @@ parseGenValue sep =
 
 parseValues :: Parser () -> Parser Values
 parseValues sep =
-  choice
-    [ Values <$> inBraces sep (many $ parseValue sep),
-      InFile . T.unpack <$> (lexeme sep "@" *> lexeme sep nextWord)
-    ]
+  try pvalues <|> try pstring <|> pfile
   where
+    pvalues = Values <$> inBraces sep (many $ parseValue sep)
+    pstring = toValues <$> inBraces sep (many $ parseText sep)
+    pfile = InFile . T.unpack <$> (lexeme sep "@" *> lexeme sep nextWord)
     nextWord = takeWhileP Nothing $ not . isSpace
+    stringLiteral = char '\"' *> manyTill L.charLiteral (char '\"')
+    parseText s = stringLiteral <* s
+    toValue str = U8Value (size str) $ byteStringToVector $ encodeUtf8 $ T.pack str
+    toValues ss = Values $ map toValue ss
+    size str = SVec.fromList [fromIntegral (B.length $ encodeUtf8 $ T.pack str)]
 
 parseWarning :: Parser () -> Parser WarningTest
 parseWarning sep = lexeme sep "warning:" >> parseExpectedWarning
