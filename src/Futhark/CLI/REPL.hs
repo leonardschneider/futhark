@@ -61,6 +61,7 @@ import Text.Megaparsec.Char
 import Control.Arrow hiding ((<+>))
 import Data.Either
 import Data.Binary (encode)
+import System.Console.Haskeline (completeFilename)
 
 banner :: String
 banner =
@@ -131,7 +132,16 @@ repl maybe_prog = do
           return s {futharkiLoaded = maybe_prog}
     Right s ->
       return s
-  Haskeline.runInputT Haskeline.defaultSettings $ toploop s
+  home <- getHomeDirectory
+  let historyFile = home </> ".futhark" </> "history"
+  createDirectoryIfMissing False $ home </> ".futhark"
+
+  let settings = Haskeline.Settings {
+          complete = completeFilename,
+          historyFile = Just historyFile ,
+          autoAddHistory = True
+        }
+  Haskeline.runInputT settings $ toploop s
 
   putStrLn "Leaving 'futhark repl'."
 
@@ -738,7 +748,7 @@ sc =
     char '\n',
     char '\r',
     char '\t'
-  ] 
+  ]
 
 optParser :: ArgOrder a
   -> [OptDescr a]
