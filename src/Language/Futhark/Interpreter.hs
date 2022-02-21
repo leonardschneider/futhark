@@ -17,7 +17,7 @@ module Language.Futhark.Interpreter
     BreakReason (..),
     StackFrame (..),
     typeCheckerEnv,
-    Value (ValuePrim, ValueArray, ValueRecord),
+    Value (ValuePrim, ValueArray, ValueRecord, ValueSum),
     fromTuple,
     isEmptyArray,
     prettyEmptyArray,

@@ -7,11 +7,15 @@
 {-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -Wno-type-defaults #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Redundant lambda" #-}
 
 -- | @futhark repl@
 module Futhark.CLI.REPL (main) where
 
-import Control.Exception
+import Control.Exception hiding (try)
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Free.Church
@@ -39,15 +43,24 @@ import qualified System.Console.Haskeline as Haskeline
 import System.Directory
 import System.FilePath
 import Text.Read (readMaybe)
-import qualified Data.Array as D
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Char8 as C
+import Data.Array
+import qualified Data.ByteString.Lazy.Char8 as C
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Lazy.UTF8 as BLU
+import Data.ByteString.Builder
+import Text.Megaparsec
 import Futhark.IR.Primitive (valueIntegral)
 import System.Process (CreateProcess (delegate_ctlc), withCreateProcess, waitForProcess, proc)
 import qualified Data.Map as M
 import GHC.IO.Exception (ExitCode(ExitSuccess, ExitFailure))
-import Futhark.Test (getExpectedResult)
+import Data.Void
+import Data.String
+import Data.Functor
+import Data.Bits
+import Text.Megaparsec.Char
+import Control.Arrow hiding ((<+>))
+import Data.Either
+import Data.Binary (encode)
 
 banner :: String
 banner =
@@ -155,7 +168,7 @@ data FutharkiState = FutharkiState
   }
 
 newFutharkiState :: Int -> Maybe FilePath -> IO (Either String FutharkiState)
-newFutharkiState count maybe_file = runExceptT $ do
+newFutharkiState count0 maybe_file = runExceptT $ do
   (imports, src, tenv, ienv) <- case maybe_file of
     Nothing -> do
       -- Load the builtins through the type checker.
@@ -203,7 +216,7 @@ newFutharkiState count maybe_file = runExceptT $ do
     FutharkiState
       { futharkiImports = imports,
         futharkiNameSource = src,
-        futharkiCount = count,
+        futharkiCount = count0,
         futharkiEnv = (tenv, ienv),
         futharkiBreaking = Nothing,
         futharkiSkipBreaks = mempty,
@@ -343,7 +356,7 @@ onExp e = do
       liftIO $ do print v
     process _ (Right v) =
       liftIO $ putStrLn $ pretty v
-    msg (I.ValueArray _ vs) = B.pack $ map (fromIntegral . getValue) $ D.elems vs
+    msg (I.ValueArray _ vs) = BL.pack $ map (fromIntegral . getValue) $ elems vs
     msg _ = error "Value type not supported"
     getValue (I.ValuePrim (UnsignedValue v)) = valueIntegral v
     getValue (I.ValuePrim (SignedValue v)) = valueIntegral v
@@ -475,179 +488,309 @@ loadCommand file = do
 -- tuple: ([102u8, 111u8, 111u8], [0x00000001u32, 0x0000002au32])
 
 -- Data structures
-data FormatType = FormatStr | FormatBin | FormatHex | FormatHeX | FormatDec
-instance Show FormatType where
-  show FormatStr = "string"
-  show FormatBin = "binary"
-  show FormatHex = "hexadecimal"
-  show FormatHeX = "hexadecimal"
-  show FormatDec = "decimal"
+data FormatType = FormatStr | FormatBin | FormatHex | FormatHeX | FormatDec deriving Show
+
 data Format =
-  FormatArray { lbracket :: String, fmt:: Format, sep :: String, rbracket:: String, suffix :: Bool } |
-  FormatTuple { start :: String, elems :: [{fmt :: Format, sep :: String}], suffix :: Bool } |
+  FormatArray {
+    lbracket :: String,
+    fmt:: Format,
+    sep :: String,
+    rbracket:: String,
+    suffix :: Bool
+  } |
   FormatValue {
     prefix :: Bool,
     ftype :: FormatType,
     suffix :: Bool
-  } |
-  StringPart String
-data FormatExp = FormatExp String Format | FormatDefault String | StringPart String
+  } deriving Show
+data FormatExp = FormatExp String Format | FormatDefault String | StringPart String deriving Show
 type FormatString = [FormatExp]
--- Convenient defaults
-formatArray = FormatArray {sep="", suffix=False, prefix=False}
-formatTuple = FormatTuple {suffix=False}
-formatValue = FormatValue {prefix=False, suffix=False}
 
 -- Rendering
-printf :: (String -> IO I.Value) -> FormatString -> IO BL.ByteString
-printf expint fs = foldM (return $ printfmt expint) BL.empty fs
-
-printfexp :: (String -> IO I.Value) -> FormatExp -> IO BL.ByteString
-printfexp _ (FormatDefault v) = return show v
-printfexp _ (StringPart s) = return show s
-printfexp expint len (FormatExp s fmt) = do
-  exp <- expint s
-  return printfmt exp fmt
-
-printfmt :: Format -> I.Value -> BL.ByteString
-printfmt (FormatArray {sep=sep, suffix=suffix, fmt=fmt, lbracket=lbracket, rbracket=rbracket}) (I.ValueArray _ vs) =
-  lbracket <>
-  intercalate sep (map (printfmt fmt) elems) <>
-  rbracket <>
-  showSuffix suffix v
---printfmt (FormatTuple {start=start, elems=elems, suffix=suffix}) (I.ValueRecord vs) =
---  start <>
---  showRecord v elems <>
---  showSuffix suffix v
-printfmt fmt@(FormatValue {ftype=ftype, suffix=suffix, prefix=prefix}) (I.ValueArray _ vs) =
-  showPrefix prefix ftype <>
-  BL.concat $ map (printfmt fmt) vs <>
-  showSuffix suffix arr
-  --show (FormatValue {value=(I.ValueRecord vs), fmt=fmt, suffix=suffix, prefix=prefix}) =
-  --  (showPrefix prefix fmt) ++
-  --  (unwords $ (elems vs) <&> (\v -> show $ formatValue {value=v, fmt=fmt})) ++
-  --  (showSuffix suffix fmt)
-printfmt (FormatValue {prefix=prefix, suffix=suffix, ftype=ftype}) (I.ValuePrim v) =
-  showPrefix prefix ftype <>
-  showValue v <>
-  showSuffix suffix
-printfmt _ (FormatValue v) =
-  "Don't know how to display value: " <> show v
- 
-showPrefix :: Bool -> FormatType -> String
-showPrefix False _ = ""
-showPrefix True FormatHex = "0x"
-showPrefix True FormatHeX = "0x"
-showPrefix True FormatBin = "0b"
-showPrefix True FormatDec = ""
-showPrefix True FormatStr = ""
-
-showSuffix :: Bool -> I.Value -> String
-showSuffix False _ = ""
-showSuffix True v = showType v
-
-showType :: I.Value -> String
-showType (PrimValue v@(UnsignedValue _)) = "u" ++ (valueSize v)
-showType (PrimValue v@(FloatValue _)) = "f" ++ (valueSize v)
-showType (PrimValue v@(BoolValue _)) = "bool"
-showType (I.ValueArray s (v: _)) = pretty s ++ (showType v)
-showType (I.ValueArray s _) = pretty s
-showType (I.ValueRecord m)
-  | Just vs <- areTupleFields m =
-    "(" ++ (intercalate ", " $ map showType vs) ++ ")"
-  | otherwise =
-    "{" ++ (intercalate ", " $ map field $ M.toList m) ++ "}"
+printf :: Format -> I.Value -> Either String BL.ByteString
+printf = printfmt
   where
-    field (k, v) = (nameToString k) ++ ": " ++ (showType v)
-showType (I.ValueSum _ n vs)
-  | numElements vs == 0 = "#" ++ (nameToString n)
-  | otherwise = "#" ++ (nameToString n) ++ " " ++ (intercalate " " $ map showType vs)
-showType v = "Type not found for value: " ++ (pretty v)
+  printfmt :: Format -> I.Value -> Either String BL.ByteString
+  printfmt (FormatArray {sep, suffix, fmt, lbracket, rbracket}) v@(I.ValueArray _ vs) =
+    Right (fromString lbracket) <+>
+    fmap (BL.concat . intersperse (fromString sep)) (mapM (printfmt fmt) (elems vs)) <+>
+    Right (fromString rbracket) <+>
+    showSuffix suffix v
+  printfmt fmt@(FormatValue {ftype, suffix, prefix}) arr0@(I.ValueArray _ vs) =
+    showPrefix prefix ftype <+>
+    fmap BL.concat (mapM (printfmt fmt) (elems vs)) <+>
+    showSuffix suffix arr0
+  printfmt (FormatValue {prefix=prefix, suffix=suffix, ftype=ftype}) v0@(I.ValuePrim v) =
+    showPrefix prefix ftype <+>
+    showValue ftype v <+>
+    showSuffix suffix v0
+  printfmt fmt v =
+    Left $ "Don't know how to display value: " <> pretty v <>"\n with format: " <> show fmt
 
-showValue :: FormatType -> I.PrimValue -> String
-showValue FormatStr (UnsignedValue v) = C.unpack $ B.pack $ fromIntegral
-showValue FormatHex (UnsignedValue v) = show $ hexString $ B.pack $ toLower $ fromIntegral
-showValue FormatHeX (UnsignedValue v) = show $ hexString $ B.pack $ toUpper $ fromIntegral
-showValue FormatBin (UnsignedValue v) = show $ B.pack $ map word2bin $ fromIntegral
-showValue FormatDec (UnsignedValue v) = show v
-showValue FormatDec (SignedValue v) = show v
-showValue FormatDec (FloatValue v) = show v
-showValue FormatDec (BoolValue v) = show v
-showValue FormatBin (BoolValue True) = "1"
-showValue FormatBin (BoolValue False) = "0" 
-showValue ftype (SignedValue v) = showValue ftype (SignedValue v)
-showValue ftype v = "Don't know how to display " <> show ftype <> " format for " <> show v
+  (<+>) :: (Monoid m) => Either String m -> Either String m -> Either String m
+  (<+>) (Left a) (Left b) = Left $ a <> "\n" <> b
+  (<+>) (Left a) (Right _) = Left a
+  (<+>) (Right _) (Left b) = Left b
+  (<+>) (Right a) (Right b) = Right $ a <> b
 
-word2bin :: Word8 -> [Word8]
-wordbin w =
-  [testBit w i | i <- [0.. finiteBitSize w - 1]] <&> bool2word
-  where
-    bool2word False = fromIntegral 0
-    bool2word True = fromIntegral 1
 
-valueSize :: I.PrimValue -> String
-valueSize (UnsignedValue (Int8Value _)) = "8"
-valueSize (UnsignedValue (Int16Value _)) = "16"
-valueSize (UnsignedValue (Int32Value _)) = "32"
-valueSize (UnsignedValue (Int64Value _)) = "64"
-valueSize (SignedValue v) = valueSize (UnsignedValue v)
-valueSize (FloatValue (Float16Value _ )) = "16"
-valueSize (FloatValue (Float32Value _ )) = "32"
-valueSize (FloatValue (Float64Value _ )) = "32"
+
+  showPrefix :: Bool -> FormatType -> Either String BL.ByteString
+  showPrefix False _ = Right ""
+  showPrefix True FormatHex = Right "0x"
+  showPrefix True FormatHeX = Right "0x"
+  showPrefix True FormatBin = Right "0b"
+  showPrefix True FormatDec = Right ""
+  showPrefix True FormatStr = Right ""
+
+  showSuffix :: Bool -> I.Value -> Either String BL.ByteString
+  showSuffix False _ = Right ""
+  showSuffix True v = showType v
+
+  showType :: I.Value -> Either String BL.ByteString
+  showType (I.ValuePrim v@(UnsignedValue _)) = Right (fromString "u") <+> valueSize v
+  showType (I.ValuePrim v@(FloatValue _)) = Right (fromString "f") <> valueSize v
+  showType (I.ValuePrim (BoolValue _)) = Right (fromString "bool")
+  showType (I.ValueArray s vs) = Right (fromString (pretty s)) <+> showType (head $ elems vs)
+  showType (I.ValueRecord m)
+    | Just vs <- areTupleFields m =
+      Right (fromString "(") <+>
+      fmap (BL.intercalate (fromString ", ")) (mapM showType vs) <+>
+      Right (fromString ")")
+    | otherwise =
+      Right (fromString "{") <+>
+      fmap (BL.intercalate (fromString ", ")) (mapM field (M.toList m)) <+>
+      Right (fromString "}")
+    where
+      field (k, v) = Right (fromString $ nameToString k <> ": ") <+> showType v
+  showType (I.ValueSum _ n vs)
+    | null vs = Right $ fromString $ "#" <> nameToString n
+    | otherwise =
+        Right (fromString ("#" <> nameToString n <> " ")) <+>
+        fmap BL.concat (mapM showType vs)
+  showType v = Right $ fromString $ "Type not found for value: " <> pretty v
+
+  showValue :: FormatType -> PrimValue -> Either String BL.ByteString
+  showValue FormatDec (UnsignedValue (Int8Value v)) = Right $ toLazyByteString $ int8Dec v
+  showValue FormatDec (UnsignedValue (Int16Value v)) = Right $ toLazyByteString $ int16Dec v
+  showValue FormatDec (UnsignedValue (Int32Value v)) = Right $ toLazyByteString $ int32Dec v
+  showValue FormatDec (UnsignedValue (Int64Value v)) = Right $ toLazyByteString $ int64Dec v
+  showValue FormatDec (FloatValue (Float32Value v)) = Right $ toLazyByteString $ floatDec v
+  showValue FormatDec (FloatValue (Float64Value v)) = Right $ toLazyByteString $ doubleDec v
+  showValue FormatHex (UnsignedValue (Int8Value v)) = Right $ toLazyByteString $ int8HexFixed v
+  showValue FormatHex (UnsignedValue (Int16Value v)) = Right $ toLazyByteString $ int16HexFixed v
+  showValue FormatHex (UnsignedValue (Int32Value v)) = Right $ toLazyByteString $ int32HexFixed v
+  showValue FormatHex (UnsignedValue (Int64Value v)) = Right $ toLazyByteString $ int64HexFixed v
+  showValue FormatHex (FloatValue (Float32Value v)) = Right $ toLazyByteString $ floatHexFixed v
+  showValue FormatHex (FloatValue (Float64Value v)) = Right $ toLazyByteString $ doubleHexFixed v
+  showValue FormatHeX v@(UnsignedValue _) = C.map toUpper <$> showValue FormatHex v
+  showValue FormatBin (UnsignedValue (Int8Value v)) = Right $ BL.concatMap word2bin (encode v)
+  showValue FormatStr (UnsignedValue (Int8Value v)) = Right $ encode v
+  showValue FormatStr (UnsignedValue (Int16Value v)) = Right $ encode v
+  showValue FormatStr (UnsignedValue (Int32Value v)) = Right $ encode v
+  showValue FormatStr (UnsignedValue (Int64Value v)) = Right $ encode v
+  showValue FormatBin (BoolValue True) = Right $ fromString "1"
+  showValue FormatBin (BoolValue False) = Right $ fromString "0"
+  showValue ftype (SignedValue v) = showValue ftype (UnsignedValue v)
+  showValue ftype v = Left $ "Don't know how to display " <> show ftype <> " format for " <> show v
+
+  word2bin :: Word8 -> BL.ByteString
+  word2bin w = BL.pack $ reverse $
+    [testBit w i | i <- [0.. finiteBitSize w - 1]] <&> bool2word
+    where
+      bool2word False = 48 -- ascii '0'
+      bool2word True  = 49 -- ascii '1'
+
+  valueSize :: PrimValue -> Either String BL.ByteString
+  valueSize (UnsignedValue (Int8Value _)) = Right "8"
+  valueSize (UnsignedValue (Int16Value _)) = Right "16"
+  valueSize (UnsignedValue (Int32Value _)) = Right "32"
+  valueSize (UnsignedValue (Int64Value _)) = Right "64"
+  valueSize (SignedValue v) = valueSize (UnsignedValue v)
+  valueSize (FloatValue (Float16Value _ )) = Right "16"
+  valueSize (FloatValue (Float32Value _ )) = Right "32"
+  valueSize (FloatValue (Float64Value _ )) = Right "32"
+  valueSize v = Left $ "Cannot find size for: " <> show v
 
 -- Parsing
-p_formatstring =
-  between '"' '"' $ many $ choice [
-    p_stringpart <&> StringPart,
-    between '{' '}' choice [
-      p_exp <* char ':' <*> p_format <&> FormatExp,
-      p_exp <&> FormatDefault
+type Parser = Parsec Void T.Text
+
+formatStringParser :: Parser FormatString
+formatStringParser =
+  between (char '"') (char '"') (many $ choice [
+    try $ StringPart <$> stringPartParser,
+    try $ between (char '{') (char '}') repParser
+  ])
+
+  where
+
+  repParser =
+    choice [
+      try $ FormatExp <$> expParser <*> (char ':' *> formatParser),
+      try $ FormatDefault <$> expParser
     ]
-  ]
 
-p_exp = (many (noneOf [char ':']))
+  expParser = some (try $ satisfy (\c -> c /= ':' && c /= '{' && c/= '}') :: Parser Char)
 
-p_format = choice [
-  FormatArray <$> p_prefix <*> single <*> string ".." <*> p_format <*> p_sep <*> string ".." <*> single <*> p_suffix,
-  FormatValue <$> p_prefix <*> p_ftype <*> p_suffix
-]
+  formatParser =
+    choice [
+      try formatValueParser,
+      try formatArrayParser
+    ]
 
-p_sep = many $ single <* notFollowedBy $ char '.'
+  formatArrayParser =
+    FormatArray <$>
+    lbracketParser <*>
+    (string ".." *> formatParser) <*>
+    sepParser <*>
+    (string ".." *> rbracketParser) <*>
+    suffixParser
 
-p_prefix =
+  lbracketParser = many (try $ satisfy (/= '.') :: Parser Char) <?> "lbracket"
+
+  rbracketParser = many (try $ satisfy (\c -> c/= '$' && c /= '}') :: Parser Char) <?> "rbracket"
+
+  formatValueParser =
+    FormatValue <$>
+    prefixParser <*>
+    ftypeParser <*>
+    suffixParser
+
+  sepParser = many $
+    choice [
+      try $ satisfy (/= '.') :: Parser Char,
+      try $ char '.' <* notFollowedBy (char '.')
+    ]
+
+  prefixParser =
+    choice [
+      try (char '#') $> True,
+      return False :: Parser Bool
+    ]
+  ftypeParser =
+    choice [
+      string "x" $> FormatHex,
+      string "X" $> FormatHeX,
+      string "b" $> FormatBin,
+      string "s" $> FormatStr,
+      string "d" $> FormatDec
+    ]
+  suffixParser =
+    choice [
+      try $ char '$' $> True,
+      return False :: Parser Bool
+    ]
+  stringPartParser = some $
+    choice [
+      try $ satisfy (\c -> c /= '{' && c /= '}' && c /= '"') :: Parser Char,
+      string "{{" $> '{',
+      string "}}" $> '}',
+      string "\\\"" $> '"'
+    ]
+
+evalExp :: Kleisli
+  FutharkiM
+  T.Text
+  (Either String (Warnings, I.Value))
+evalExp =
+  parseExp "" ^>>
+  left (arr show) >>>
+  right checkExp >>>
+  (arr Left ||| left (arr id)) >>>
+  right interpExp >>>
+  (arr Left ||| left (arr id))
+  where
+    checkExp = Kleisli (return getIt) &&& returnA >>^
+      \((imports, src, tenv, ienv), e) ->
+        case T.checkExp imports src tenv e of
+          (warning, Right (tparams, e'))
+            | null tparams -> Right (warning, (ienv, e'))
+            | otherwise -> Left ("Ambiguous expression: " <> show e)
+          (_, Left err) -> Left (pretty err)
+
+    interpExp = second (Kleisli (runInterpreter' . uncurry I.interpretExp)) >>^
+      \case
+        (warning, Right v) -> Right (warning, v)
+        (_, Left err) -> Left (show err)
+
+render :: [FormatExp] -> FutharkiM [Either String (Warnings, BL.ByteString)]
+render = mapM \case
+  StringPart s -> return $ Right (mempty, BLU.fromString s)
+  FormatDefault e -> render' e Nothing
+  FormatExp e fmt -> render' e (Just fmt)
+  where
+    render' e maybeFmt= runKleisli (
+        T.pack ^>>
+        evalExp >>>
+        right (arr $ printf' maybeFmt) >>>
+        (arr Left ||| left (arr id))
+      ) e
+    printf' (Just fmt) (w, v) =
+      case printf fmt v of
+        Left err -> Left $ pretty w <> "\n" <> err
+        Right ls -> Right (w, ls)
+    printf' Nothing (w, v) = Right (w, BLU.fromString $ pretty v)
+
+sc :: Parser Char
+sc =
   choice [
-    char '#' $> True,
-    return False :: Parser Bool
-  ]
-p_ftype =
-  choice [
-    char 'x' $> FormatHex,
-    char 'X' $> FormatHeX,
-    char 'b' $> FormatBin,
-    char 's' $> FormatStr,
-    char 'd' $> FormatDec
-  ]
-p_suffix = 
-  choice [
-    char '$' $> True,
-    return False :: Parser Bool
-  ]
-p_stringpart = many $
-  choice [
-    noneOf [char '{', char '}', eof],
-    string "{{" $> '{',
-    string "}}" $> '}'
+    char ' ',
+    char '\n',
+    char '\r',
+    char '\t'
+  ] 
+
+optParser :: ArgOrder a
+  -> [OptDescr a]
+  -> Parser end
+  -> Parser (([a], [String], [String]), end)
+optParser argorder opts p =
+  (first (getOpt argorder opts) <$> manyTill_ (try $ optionParser <* some (try sc)) (try p)) <* eof
+  where
+    optionParser = some $
+      choice [
+        try alphaNumChar,
+        try $ char '-',
+        try $ char '=',
+        try $ char '_',
+        try $ char '/'
+      ]
+
+data PrintFlag = PrintParse deriving (Show, Eq)
+
+printOptions :: [OptDescr PrintFlag]
+printOptions =
+  [ Option [] ["parse"] (NoArg PrintParse) "Parse print expression"
   ]
 
 printCommand :: Command
-printCommand =
-  genCommand parseExp T.checkExp $ \(tparams, e) -> do
-    if null tparams then do
-      (imports, src, tenv, ienv) <- getIt
-      r <- runInterpreter $ I.interpretExp ienv e
-      
+printCommand = runKleisli $
+  parse (optParser Permute printOptions formatStringParser) "" ^>>
+  optParse ^>>
+  right render' >>>
+  (Kleisli (liftIO . putStrLn) ||| Kleisli (liftIO . C.putStrLn . BLU.take 10000))
+  where
+    optParse (Left err) = Left $ errorBundlePretty err
+    optParse (Right ((_,_,errs@(_:_)), _)) = Left $ intercalate "\n" errs
+    optParse (Right ((flags, _, _), fstring :: FormatString)) =
+      if PrintParse `elem` flags then
+        Left $ show fstring
       else
-        liftIO $ putStrLn "Cannot print declaration."
+        Right fstring
+    render' :: Kleisli FutharkiM [FormatExp] BL.ByteString
+    render' = Kleisli render >>^ \res ->
+      if null $ lefts res then
+        let
+          (ws, rs) = unzip $ rights res
+          wstr = BLU.fromString $ pretty $ mconcat ws
+          rstr = BL.concat rs
+        in
+          if BL.null wstr then
+            rstr
+          else
+            wstr <> "\n" <> rstr
+      else
+        BLU.fromString $ concat $ lefts res
 
 -- Display Futhark AST for expression or declaration
 astCommand :: Command
@@ -780,6 +923,13 @@ Show the type of a module expression, which must fit on a single line.
       ( astCommand,
         [text|
 Show the Futhark AST of a declaration or expression.
+|]
+      )
+    ),
+    ( "print",
+      ( printCommand,
+        [text|
+Print Futhark expression.
 |]
       )
     ),
