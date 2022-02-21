@@ -50,7 +50,7 @@ import qualified Data.ByteString.Lazy.UTF8 as BLU
 import Data.ByteString.Builder
 import Text.Megaparsec
 import Futhark.IR.Primitive (valueIntegral)
-import System.Process (CreateProcess (delegate_ctlc), withCreateProcess, waitForProcess, proc)
+import System.Process (CreateProcess (delegate_ctlc), withCreateProcess, waitForProcess, proc, callCommand)
 import qualified Data.Map as M
 import GHC.IO.Exception (ExitCode(ExitSuccess, ExitFailure))
 import Data.Void
@@ -62,6 +62,7 @@ import Control.Arrow hiding ((<+>))
 import Data.Either
 import Data.Binary (encode)
 import System.Console.Haskeline (completeFilename)
+import System.IO.Error (catchIOError)
 
 banner :: String
 banner =
@@ -276,6 +277,8 @@ readEvalPrint = do
           liftIO . T.putStrLn $
             "Ambiguous command; could be one of "
               <> mconcat (intersperse ", " (map fst matches))
+    Just ('!', commandLine) -> do
+      liftIO $ catchIOError (callCommand $ T.unpack commandLine) print
     _ -> do
       -- Read a declaration or expression.
       maybe_dec_or_e <- parseDecOrExpIncrM (inputLine "  ") prompt line
